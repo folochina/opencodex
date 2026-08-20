@@ -13,7 +13,6 @@ import {
 import {
   isValidCost4Rate,
   refreshUserCostOverlays,
-  type COST4_RATE_KEYS,
 } from "../../usage/user-cost-overlays";
 import type { ProviderCostOverlay } from "../../types";
 import { jsonResponse } from "../auth-cors";
@@ -37,12 +36,15 @@ function statisticsQuery(url: URL, now: number): StatisticsQuery {
   const defaultFrom = now - 7 * 24 * 60 * 60_000;
   const from = parseTime(url.searchParams.get("from"), defaultFrom);
   const to = parseTime(url.searchParams.get("to"), now);
+  const provider = optionalFilter(url.searchParams.get("provider"));
+  const account = optionalFilter(url.searchParams.get("account"));
+  const model = optionalFilter(url.searchParams.get("model"));
   return {
     from,
     to,
-    ...(optionalFilter(url.searchParams.get("provider")) ? { provider: optionalFilter(url.searchParams.get("provider")) } : {}),
-    ...(optionalFilter(url.searchParams.get("account")) ? { account: optionalFilter(url.searchParams.get("account")) } : {}),
-    ...(optionalFilter(url.searchParams.get("model")) ? { model: optionalFilter(url.searchParams.get("model")) } : {}),
+    ...(provider ? { provider } : {}),
+    ...(account ? { account } : {}),
+    ...(model ? { model } : {}),
   };
 }
 
