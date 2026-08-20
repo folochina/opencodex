@@ -297,13 +297,15 @@ function addEntry(rows: Map<string, StatisticsBucket>, entry: PersistedUsageEntr
   }
 }
 
-function addEntries(store: PersistedStatisticsStore, entries: PersistedUsageEntry[]): void {
-  if (entries.length === 0) return;
+function addEntries(store: PersistedStatisticsStore, entries: PersistedUsageEntry[]): boolean {
+  if (entries.length === 0) return false;
   const rows = new Map(store.rows.map(row => [rowKey(row), { ...row }]));
   const recent = new Set(store.recentRequestIds);
+  let changed = false;
   for (const entry of entries) {
     if (recent.has(entry.requestId)) continue;
     addEntry(rows, entry);
+    changed = true;
     recent.add(entry.requestId);
     store.recentRequestIds.push(entry.requestId);
     if (store.recentRequestIds.length > STATISTICS_CURSOR_RECENT_IDS) {
@@ -313,10 +315,12 @@ function addEntries(store: PersistedStatisticsStore, entries: PersistedUsageEntr
     store.cursorRequestId = entry.requestId;
     store.lastSeenTimestamp = Math.max(store.lastSeenTimestamp, entry.timestamp);
   }
+  if (!changed) return false;
   store.rows = [...rows.values()].sort((a, b) => a.bucketStart - b.bucketStart
     || a.provider.localeCompare(b.provider)
     || a.account.localeCompare(b.account)
     || a.model.localeCompare(b.model));
+  return true;
 }
 
 async function syncStatisticsStoreInner(): Promise<PersistedStatisticsStore> {
@@ -325,9 +329,13 @@ async function syncStatisticsStoreInner(): Promise<PersistedStatisticsStore> {
   const identity = usageLogIdentityKey(snapshot.revision);
   if (!snapshot.revision || snapshot.entries.length === 0) return store;
 
-  let source = snapshot.entries;
+  const initialBackfill = store.sourceIdentity === null
+    && store.cursorRequestId === null
+    && store.rows.length === 0;
+  const identityChanged = store.sourceIdentity !== identity;
+  let source = initialBackfill ? readUsageEntries() : snapshot.entries;
   let startIndex = -1;
-  if (store.sourceIdentity === identity && store.cursorRequestId) {
+  if (!initialBackfill && store.sourceIdentity === identity && store.cursorRequestId) {
     startIndex = source.findIndex(entry => entry.requestId === store.cursorRequestId);
     if (startIndex < 0) {
       // The cursor can fall out of the bounded management window after a long idle
@@ -338,7 +346,7 @@ async function syncStatisticsStoreInner(): Promise<PersistedStatisticsStore> {
     }
   }
 
-  if (store.sourceIdentity !== identity) {
+  if (!initialBackfill && identityChanged) {
     // A replaced/rotated ledger is a new source. Preserve already aggregated history,
     // but admit only rows newer than the last observed request timestamp and keep a
     // small request-id overlap guard so a copied tail is not double counted.
@@ -347,9 +355,11 @@ async function syncStatisticsStoreInner(): Promise<PersistedStatisticsStore> {
   }
 
   const nextEntries = startIndex >= 0 ? source.slice(startIndex + 1) : source;
-  addEntries(store, nextEntries);
+  const changed = addEntries(store, nextEntries);
   store.sourceIdentity = identity;
-  persistStatisticsStore(store);
+  // Idle dashboard refreshes should remain read-only. Rewriting a growing aggregate
+  // file every 60 seconds would turn the statistics page into avoidable storage I/O.
+  if (changed || identityChanged) persistStatisticsStore(store);
   return store;
 }
 
