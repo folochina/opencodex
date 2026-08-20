@@ -1,16 +1,10 @@
-import {
-  chmodSync,
-  existsSync,
-  mkdirSync,
-  readFileSync,
-  renameSync,
-  unlinkSync,
-  writeFileSync,
-} from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { getConfigDir } from "../config";
-import { recordOwnedConfigPath } from "../lib/config-ownership";
+import { atomicWriteFile, getConfigDir } from "../config";
+import { listCodexAuthAccountsSnapshot } from "../codex/auth-api";
 import { baseProviderLabel } from "../providers/label";
+import { isCanonicalOpenAiForwardProvider, OPENAI_CODEX_PROVIDER_ID } from "../providers/openai-tiers";
+import { providerCodexAccountMode } from "../providers/registry";
 import {
   fetchProviderQuotaReports,
   type ProviderQuota,
@@ -104,11 +98,11 @@ export interface StatisticsQuotaRow {
 export interface StatisticsPriceRow {
   provider: string;
   model: string;
-  input: number;
-  output: number;
-  cacheRead: number;
-  cacheWrite: number;
-  source: MatchedPrice["source"];
+  input: number | null;
+  output: number | null;
+  cacheRead: number | null;
+  cacheWrite: number | null;
+  source: MatchedPrice["source"] | "unpriced";
   custom: boolean;
 }
 
@@ -208,19 +202,7 @@ function loadStatisticsStore(): PersistedStatisticsStore {
 }
 
 function persistStatisticsStore(store: PersistedStatisticsStore): void {
-  const dir = getConfigDir();
-  const path = statisticsPath(dir);
-  const temp = `${path}.tmp-${process.pid}`;
-  recordOwnedConfigPath(dir, path);
-  mkdirSync(dir, { recursive: true, mode: 0o700 });
-  try { chmodSync(dir, 0o700); } catch { /* platform best effort */ }
-  try {
-    writeFileSync(temp, JSON.stringify(store), { encoding: "utf8", mode: 0o600 });
-    try { chmodSync(temp, 0o600); } catch { /* platform best effort */ }
-    renameSync(temp, path);
-  } finally {
-    try { if (existsSync(temp)) unlinkSync(temp); } catch { /* best effort */ }
-  }
+  atomicWriteFile(statisticsPath(), JSON.stringify(store));
 }
 
 function cacheReadTokens(usage: OcxUsage): number {
@@ -267,8 +249,7 @@ function rowKey(row: Pick<StatisticsBucket, "bucketStart" | "provider" | "accoun
 
 function addEntry(rows: Map<string, StatisticsBucket>, entry: PersistedUsageEntry): void {
   const bucketStart = Math.floor(entry.timestamp / STATISTICS_BUCKET_MS) * STATISTICS_BUCKET_MS;
-  const attributions = entryAttributions(entry);
-  for (const attribution of attributions) {
+  for (const attribution of entryAttributions(entry)) {
     const seed: StatisticsBucket = {
       bucketStart,
       provider: attribution.provider,
@@ -348,8 +329,8 @@ async function syncStatisticsStoreInner(): Promise<PersistedStatisticsStore> {
 
   if (!initialBackfill && identityChanged) {
     // A replaced/rotated ledger is a new source. Preserve already aggregated history,
-    // but admit only rows newer than the last observed request timestamp and keep a
-    // small request-id overlap guard so a copied tail is not double counted.
+    // but admit only rows newer than the last observed request timestamp. The bounded
+    // request-id overlap below prevents copied tails from being counted twice.
     source = source.filter(entry => entry.timestamp >= store.lastSeenTimestamp);
     startIndex = -1;
   }
@@ -357,8 +338,8 @@ async function syncStatisticsStoreInner(): Promise<PersistedStatisticsStore> {
   const nextEntries = startIndex >= 0 ? source.slice(startIndex + 1) : source;
   const changed = addEntries(store, nextEntries);
   store.sourceIdentity = identity;
-  // Idle dashboard refreshes should remain read-only. Rewriting a growing aggregate
-  // file every 60 seconds would turn the statistics page into avoidable storage I/O.
+  // Idle dashboard refreshes stay read-only. Rewriting a growing aggregate every
+  // 60 seconds would make the statistics page itself a source of storage churn.
   if (changed || identityChanged) persistStatisticsStore(store);
   return store;
 }
@@ -454,7 +435,17 @@ function topModelRows(rows: StatisticsBucket[], limit = 10): StatisticsModelRow[
   const grouped = new Map<string, StatisticsBucket>();
   for (const row of rows) {
     const key = `${row.provider}\u0000${row.account}\u0000${row.model}`;
-    const current = grouped.get(key) ?? { ...row, bucketStart: 0, requests: 0, attempts: 0, inputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0 };
+    const current = grouped.get(key) ?? {
+      ...row,
+      bucketStart: 0,
+      requests: 0,
+      attempts: 0,
+      inputTokens: 0,
+      cacheReadInputTokens: 0,
+      cacheCreationInputTokens: 0,
+      outputTokens: 0,
+      reasoningOutputTokens: 0,
+    };
     current.requests += row.requests;
     current.attempts += row.attempts;
     current.inputTokens += row.inputTokens;
@@ -492,6 +483,14 @@ function costProviderRows(rows: StatisticsBucket[]): StatisticsCostProviderRow[]
     .sort((a, b) => b.estimatedCostUsd - a.estimatedCostUsd);
 }
 
+interface QuotaWindowCandidate {
+  type: StatisticsQuotaRow["quotaType"];
+  label: string;
+  percent: number;
+  resetAt?: number;
+  durationMs?: number;
+}
+
 function knownWindowDurationMs(kind: StatisticsQuotaRow["quotaType"], label: string): number | null {
   if (kind === "five-hour") return 5 * 60 * 60_000;
   if (kind === "weekly") return 7 * 24 * 60 * 60_000;
@@ -503,61 +502,128 @@ function knownWindowDurationMs(kind: StatisticsQuotaRow["quotaType"], label: str
   return null;
 }
 
-interface QuotaWindowCandidate {
-  type: StatisticsQuotaRow["quotaType"];
-  label: string;
-  percent: number;
-  resetAt?: number;
-}
-
-function quotaWindows(quota: ProviderQuota): QuotaWindowCandidate[] {
+function providerQuotaWindows(quota: ProviderQuota): QuotaWindowCandidate[] {
   const rows: QuotaWindowCandidate[] = [];
-  if (typeof quota.fiveHourPercent === "number") rows.push({ type: "five-hour", label: "5-hour", percent: quota.fiveHourPercent, resetAt: quota.fiveHourResetAt });
-  if (typeof quota.weeklyPercent === "number") rows.push({ type: "weekly", label: "Weekly", percent: quota.weeklyPercent, resetAt: quota.weeklyResetAt });
-  if (typeof quota.monthlyPercent === "number") rows.push({ type: "monthly", label: "Monthly", percent: quota.monthlyPercent, resetAt: quota.monthlyResetAt });
+  if (typeof quota.fiveHourPercent === "number") {
+    rows.push({ type: "five-hour", label: "5-hour", percent: quota.fiveHourPercent, resetAt: quota.fiveHourResetAt });
+  }
+  if (typeof quota.weeklyPercent === "number") {
+    rows.push({ type: "weekly", label: "Weekly", percent: quota.weeklyPercent, resetAt: quota.weeklyResetAt });
+  }
+  if (typeof quota.monthlyPercent === "number") {
+    rows.push({ type: "monthly", label: "Monthly", percent: quota.monthlyPercent, resetAt: quota.monthlyResetAt });
+  }
   for (const window of quota.customWindows ?? []) {
     rows.push({ type: "custom", label: window.label, percent: window.percent, resetAt: window.resetAt });
   }
   return rows;
 }
 
-function quotaRows(
+type CodexAccountQuota = Awaited<ReturnType<typeof listCodexAuthAccountsSnapshot>>["accounts"][number]["quota"];
+
+function codexQuotaWindows(quota: NonNullable<CodexAccountQuota>): QuotaWindowCandidate[] {
+  const rows: QuotaWindowCandidate[] = [];
+  if (typeof quota.shortPercent === "number") {
+    const durationMs = typeof quota.shortWindowSeconds === "number" && Number.isFinite(quota.shortWindowSeconds)
+      ? quota.shortWindowSeconds * 1000
+      : undefined;
+    const isFiveHour = quota.shortWindowSeconds === 5 * 60 * 60;
+    rows.push({
+      type: isFiveHour ? "five-hour" : "custom",
+      label: isFiveHour ? "5-hour" : "Short window",
+      percent: quota.shortPercent,
+      resetAt: quota.shortResetAt,
+      ...(durationMs ? { durationMs } : {}),
+    });
+  }
+  if (typeof quota.weeklyPercent === "number") {
+    rows.push({ type: "weekly", label: "Weekly", percent: quota.weeklyPercent, resetAt: quota.weeklyResetAt });
+  }
+  if (typeof quota.monthlyPercent === "number") {
+    rows.push({ type: "monthly", label: "Monthly", percent: quota.monthlyPercent, resetAt: quota.monthlyResetAt });
+  }
+  return rows;
+}
+
+interface QuotaScope {
+  provider: string;
+  account: string;
+  windows: QuotaWindowCandidate[];
+}
+
+async function quotaScopes(
+  config: OcxConfig,
   reports: ProviderQuotaReport[],
-  allRows: StatisticsBucket[],
-  now: number,
-): StatisticsQuotaRow[] {
-  const earliest = allRows[0]?.bucketStart ?? Number.POSITIVE_INFINITY;
-  const out: StatisticsQuotaRow[] = [];
+): Promise<QuotaScope[]> {
+  const scopes: QuotaScope[] = [];
+  const openai = config.providers[OPENAI_CODEX_PROVIDER_ID];
+  const codexPool = !!openai
+    && openai.disabled !== true
+    && isCanonicalOpenAiForwardProvider(openai)
+    && providerCodexAccountMode(OPENAI_CODEX_PROVIDER_ID, openai) === "pool";
+
+  let codexAccountScopes = 0;
+  if (codexPool) {
+    try {
+      const snapshot = await listCodexAuthAccountsSnapshot(config, false);
+      for (const account of snapshot.accounts) {
+        if (!account.logLabel || !account.quota) continue;
+        const windows = codexQuotaWindows(account.quota);
+        if (windows.length === 0) continue;
+        scopes.push({ provider: OPENAI_CODEX_PROVIDER_ID, account: account.logLabel, windows });
+        codexAccountScopes += 1;
+      }
+    } catch {
+      // Provider-level quota below remains as a safe fallback when account probing fails.
+    }
+  }
+
   for (const report of reports) {
     const provider = baseProviderLabel(report.provider);
-    for (const window of quotaWindows(report.quota)) {
+    if (provider === OPENAI_CODEX_PROVIDER_ID && codexAccountScopes > 0) continue;
+    const windows = providerQuotaWindows(report.quota);
+    if (windows.length > 0) scopes.push({ provider, account: "default", windows });
+  }
+  return scopes;
+}
+
+function quotaRows(scopes: QuotaScope[], allRows: StatisticsBucket[], now: number): StatisticsQuotaRow[] {
+  const out: StatisticsQuotaRow[] = [];
+  for (const scope of scopes) {
+    const scopeRows = allRows.filter(row => row.provider === scope.provider
+      && (scope.account === "default" || row.account === scope.account));
+    const earliest = scopeRows[0]?.bucketStart ?? Number.POSITIVE_INFINITY;
+    for (const window of scope.windows) {
       const end = window.resetAt;
       if (typeof end !== "number" || !Number.isFinite(end) || end <= 0) continue;
-      const duration = knownWindowDurationMs(window.type, window.label);
+      const duration = window.durationMs ?? knownWindowDurationMs(window.type, window.label);
       if (!duration) continue;
       const start = end - duration;
       if (start <= 0) continue;
-      const cycleRows = allRows.filter(row => row.provider === provider && row.bucketStart >= start && row.bucketStart < Math.min(now, end));
+      const cycleRows = scopeRows.filter(row => row.bucketStart >= start && row.bucketStart < Math.min(now, end));
       const summary = summarizeRows(cycleRows);
       const usedTokens = summary.inputTokens + summary.outputTokens;
       const complete = earliest <= Math.floor(start / STATISTICS_BUCKET_MS) * STATISTICS_BUCKET_MS;
       const ratio = Math.max(0, Math.min(100, window.percent)) / 100;
+      const extrapolatable = complete && ratio > 0 && (usedTokens > 0 || window.percent === 0);
       out.push({
-        provider,
-        account: report.label || "default",
+        provider: scope.provider,
+        account: scope.account,
         quotaType: window.type,
         label: window.label,
         periodStart: start,
         periodEnd: end,
         usedPercent: window.percent,
         usedTokens,
-        estimatedTotalTokens: complete && ratio > 0 ? usedTokens / ratio : null,
+        estimatedTotalTokens: extrapolatable ? usedTokens / ratio : null,
         usedCostUsd: summary.estimatedCostUsd,
-        estimatedTotalCostUsd: complete && ratio > 0 ? summary.estimatedCostUsd / ratio : null,
+        estimatedTotalCostUsd: extrapolatable ? summary.estimatedCostUsd / ratio : null,
       });
     }
   }
-  return out.sort((a, b) => a.provider.localeCompare(b.provider) || a.periodEnd - b.periodEnd);
+  return out.sort((a, b) => a.provider.localeCompare(b.provider)
+    || a.account.localeCompare(b.account)
+    || a.periodEnd - b.periodEnd);
 }
 
 function validQueryTime(value: number): boolean {
@@ -572,6 +638,7 @@ export async function buildStatisticsResponse(config: OcxConfig, query: Statisti
     syncStatisticsStore(),
     fetchProviderQuotaReports(config, false),
   ]);
+  const scopes = await quotaScopes(config, reports.reports);
   const currentRows = store.rows.filter(row => rowMatches(row, query));
   const span = query.to - query.from;
   const previousQuery: StatisticsQuery = { ...query, from: query.from - span, to: query.from };
@@ -588,7 +655,7 @@ export async function buildStatisticsResponse(config: OcxConfig, query: Statisti
     trend: groupTrend(currentRows, granularity),
     models: topModelRows(currentRows),
     costsByProvider: costProviderRows(currentRows),
-    quotas: quotaRows(reports.reports, allRows, Date.now()),
+    quotas: quotaRows(scopes, allRows, Date.now()),
     filters: {
       providers: [...new Set(allRows.map(row => row.provider))].sort(),
       accounts: [...new Set(allRows.map(row => row.account))].sort(),
@@ -600,20 +667,21 @@ export async function buildStatisticsResponse(config: OcxConfig, query: Statisti
 export async function statisticsPriceRows(): Promise<StatisticsPriceRow[]> {
   const store = await syncStatisticsStore();
   const keys = new Map<string, { provider: string; model: string }>();
-  for (const row of store.rows) keys.set(`${row.provider}\u0000${row.model}`, { provider: row.provider, model: row.model });
+  for (const row of store.rows) {
+    keys.set(`${row.provider}\u0000${row.model}`, { provider: row.provider, model: row.model });
+  }
   const prices: StatisticsPriceRow[] = [];
   for (const { provider, model } of keys.values()) {
     const price = resolveMatchedPrice(provider, model);
-    if (!price) continue;
     prices.push({
       provider,
       model,
-      input: price.cost4.input,
-      output: price.cost4.output,
-      cacheRead: price.cost4.cacheRead,
-      cacheWrite: price.cost4.cacheWrite,
-      source: price.source,
-      custom: price.source === "user",
+      input: price?.cost4.input ?? null,
+      output: price?.cost4.output ?? null,
+      cacheRead: price?.cost4.cacheRead ?? null,
+      cacheWrite: price?.cost4.cacheWrite ?? null,
+      source: price?.source ?? "unpriced",
+      custom: price?.source === "user",
     });
   }
   return prices.sort((a, b) => a.provider.localeCompare(b.provider) || a.model.localeCompare(b.model));
