@@ -19,6 +19,8 @@ import { jsonResponse } from "../auth-cors";
 import { readManagementJsonBody, rethrowManagementBodyTooLarge } from "./body";
 import type { ManagementContext } from "./context";
 
+const COST_FIELDS = ["input", "output", "cacheRead", "cacheWrite"] as const;
+
 function parseTime(value: string | null, fallback: number): number {
   if (!value) return fallback;
   const numeric = Number(value);
@@ -51,7 +53,15 @@ function statisticsQuery(url: URL, now: number): StatisticsQuery {
 function validCost4(value: unknown): value is ProviderCostOverlay {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const row = value as Record<string, unknown>;
-  return ["input", "output", "cacheRead", "cacheWrite"].every(key => isValidCost4Rate(row[key]));
+  const keys = Object.keys(row);
+  return keys.length === COST_FIELDS.length
+    && COST_FIELDS.every(key => Object.hasOwn(row, key) && isValidCost4Rate(row[key]));
+}
+
+function mutableCostMap(current: Record<string, ProviderCostOverlay> | undefined): Record<string, ProviderCostOverlay> {
+  const next = Object.create(null) as Record<string, ProviderCostOverlay>;
+  for (const [model, cost] of Object.entries(current ?? {})) next[model] = cost;
+  return next;
 }
 
 export async function handleStatisticsRoutes(ctx: ManagementContext): Promise<Response | null> {
@@ -89,19 +99,20 @@ export async function handleStatisticsRoutes(ctx: ManagementContext): Promise<Re
     }
     if (!model) return jsonResponse({ error: "model is required" }, 400);
     if (raw.cost4 !== null && !validCost4(raw.cost4)) {
-      return jsonResponse({ error: "cost4 requires input, output, cacheRead, and cacheWrite rates" }, 400);
+      return jsonResponse({ error: "cost4 requires exactly input, output, cacheRead, and cacheWrite rates" }, 400);
     }
 
     withConfigMutationLockSync(() => {
       const current = config.providers[provider]!;
-      const modelCosts = { ...(current.modelCosts ?? {}) };
+      const modelCosts = mutableCostMap(current.modelCosts);
       if (raw.cost4 === null) delete modelCosts[model];
       else modelCosts[model] = raw.cost4 as ProviderCostOverlay;
+      const entries = Object.entries(modelCosts);
       config.providers[provider] = {
         ...current,
-        ...(Object.keys(modelCosts).length > 0 ? { modelCosts } : {}),
+        ...(entries.length > 0 ? { modelCosts: Object.fromEntries(entries) } : {}),
       };
-      if (Object.keys(modelCosts).length === 0) delete config.providers[provider]!.modelCosts;
+      if (entries.length === 0) delete config.providers[provider]!.modelCosts;
       saveConfigPreservingClaudeCode(config);
     });
     reconcileLiveStateStores();
