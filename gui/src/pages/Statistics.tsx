@@ -458,7 +458,7 @@ export default function Statistics({ apiBase = API_BASE_DEFAULT }: { apiBase?: s
 
   const load = useCallback(async () => {
     const currentSequence = ++sequence.current;
-    setLoading(data === null);
+    setLoading(true);
     setError(null);
     const params = new URLSearchParams({ from: String(from), to: String(to) });
     if (provider) params.set("provider", provider);
@@ -474,9 +474,9 @@ export default function Statistics({ apiBase = API_BASE_DEFAULT }: { apiBase?: s
     } finally {
       if (sequence.current === currentSequence) setLoading(false);
     }
-  }, [account, apiBase, data, from, model, provider, t, to]);
+  }, [account, apiBase, from, model, provider, t, to]);
 
-  useEffect(() => { void load(); }, [from, provider, account, model, to]);
+  useEffect(() => { void load(); }, [load]);
 
   const allLabel = t("logs.filter.surface.all");
   const providerOptions = useMemo(() => [
