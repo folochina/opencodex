@@ -75,15 +75,8 @@ type PriceDraft = {
   cacheWrite: number;
 };
 
-type QuotaProjection = {
-  status: "ready" | "attention" | "limit";
-  exhaustAt: number | null;
-  remainingPercent: number;
-};
-
 const API_BASE_DEFAULT = import.meta.env.VITE_API_BASE || "";
-const HOUR_MS = 60 * 60_000;
-const DAY_MS = 24 * HOUR_MS;
+const DAY_MS = 24 * 60 * 60_000;
 
 function dateTimeLocal(ms: number): string {
   const d = new Date(ms);
@@ -129,15 +122,6 @@ function formatTrendLabel(ms: number, granularity: Granularity, locale: string):
   return new Intl.DateTimeFormat(locale, options).format(new Date(ms));
 }
 
-function formatDuration(ms: number): string {
-  if (!Number.isFinite(ms) || ms <= 0) return "0h";
-  const hours = Math.max(1, Math.ceil(ms / HOUR_MS));
-  if (hours < 24) return `${hours}h`;
-  const days = Math.floor(hours / 24);
-  const rest = hours % 24;
-  return rest > 0 ? `${days}d ${rest}h` : `${days}d`;
-}
-
 function quotaLabel(t: TFn, quota: QuotaRow): string {
   if (quota.quotaType === "five-hour") return t("quota.fiveHourLimit");
   if (quota.quotaType === "weekly") return t("quota.weeklyLimit");
@@ -145,38 +129,32 @@ function quotaLabel(t: TFn, quota: QuotaRow): string {
   return quota.label || t("models.customBadge");
 }
 
-function quotaResetText(t: TFn, quota: QuotaRow, now: number, locale: string): string {
-  const diff = quota.periodEnd - now;
-  if (diff > 0 && diff <= 90 * 60_000) {
-    return t("quota.resetsRelativeMinutes", { n: Math.max(1, Math.ceil(diff / 60_000)) });
-  }
-  if (diff > 0 && diff <= 48 * HOUR_MS) {
-    return t("quota.resetsRelativeHours", { n: Math.max(1, Math.ceil(diff / HOUR_MS)) });
-  }
-  return t("quota.resetsAt", { when: formatDateTime(quota.periodEnd, locale) });
+function priceSourceLabel(t: TFn, row: PriceRow): string {
+  if (row.source === "user") return t("models.customBadge");
+  if (row.source === "jawcode") return t("logs.detail.source.jawcode");
+  if (row.source === "expected") return t("logs.detail.source.expected");
+  return t("logs.cost.unavailable");
 }
 
-function projectQuota(row: QuotaRow, now: number): QuotaProjection {
-  const used = Math.max(0, Math.min(100, row.usedPercent));
-  const remainingPercent = Math.max(0, 100 - used);
-  if (used >= 100) return { status: "limit", exhaustAt: now, remainingPercent };
-
-  const elapsedHours = Math.max(0, (now - row.periodStart) / HOUR_MS);
-  const remainingHours = Math.max(0, (row.periodEnd - now) / HOUR_MS);
-  if (remainingHours <= 0) return { status: "attention", exhaustAt: row.periodEnd, remainingPercent };
-
-  const burnPerHour = elapsedHours > 0 ? used / elapsedHours : 0;
-  const exhaustAt = burnPerHour > 0
-    ? now + (remainingPercent / burnPerHour) * HOUR_MS
-    : null;
-  const attention = used >= 85 || (exhaustAt !== null && exhaustAt < row.periodEnd);
-  return { status: attention ? "attention" : "ready", exhaustAt, remainingPercent };
-}
-
-function statusLabel(t: TFn, status: QuotaProjection["status"]): string {
-  if (status === "limit") return t("quota.limitReached");
-  if (status === "attention") return t("pws.status.needsAttention");
-  return t("pws.status.ready");
+function MetricCard({
+  label,
+  value,
+  comparison,
+  children,
+}: {
+  label: string;
+  value: string;
+  comparison: string;
+  children?: React.ReactNode;
+}) {
+  return (
+    <div className="statistics-metric panel">
+      <div className="statistics-metric-label muted">{label}</div>
+      <div className="statistics-metric-value">{value}</div>
+      {children}
+      <div className="statistics-metric-delta muted">Δ {comparison}</div>
+    </div>
+  );
 }
 
 function UsageTrend({
@@ -190,23 +168,26 @@ function UsageTrend({
   locale: string;
   t: TFn;
 }) {
-  const width = 900;
-  const height = 280;
-  const pad = { left: 24, right: 24, top: 20, bottom: 34 };
+  const width = 960;
+  const height = 286;
+  const pad = { left: 28, right: 22, top: 20, bottom: 34 };
   const plotW = width - pad.left - pad.right;
   const plotH = height - pad.top - pad.bottom;
-  const maxTokens = Math.max(1, ...points.map(p => p.inputTokens + p.outputTokens));
+  const maxTokens = Math.max(1, ...points.map(point => point.inputTokens + point.outputTokens));
   const step = points.length > 0 ? plotW / points.length : plotW;
-  const barW = Math.max(4, Math.min(34, step * 0.62));
+  const barW = Math.max(4, Math.min(36, step * 0.62));
 
   return (
-    <div className="statistics-trend-body">
+    <section className="panel statistics-trend-panel">
+      <div className="statistics-panel-head">
+        <h2>{t("usage.section.overview")}</h2>
+        <code>{granularity}</code>
+      </div>
       <div className="statistics-legend" aria-hidden="true">
         <span><i className="statistics-swatch input" />{t("logs.tokens.input")}</span>
         <span><i className="statistics-swatch hit" />{t("logs.tokens.cacheRead")}</span>
         <span><i className="statistics-swatch create" />{t("logs.tokens.cacheWrite")}</span>
         <span><i className="statistics-swatch output" />{t("logs.tokens.output")}</span>
-        <code>{granularity}</code>
       </div>
       {points.length === 0 ? <div className="statistics-empty muted">{t("pws.dashboard.noUsage")}</div> : (
         <svg className="statistics-trend" viewBox={`0 0 ${width} ${height}`} role="img" aria-label={t("usage.section.overview")}>
@@ -219,16 +200,19 @@ function UsageTrend({
             const inputH = (point.inputTokens / maxTokens) * plotH;
             const outputH = (point.outputTokens / maxTokens) * plotH;
             const cacheReadH = Math.min(inputH, (point.cacheReadInputTokens / maxTokens) * plotH);
-            const cacheWriteH = Math.min(Math.max(0, inputH - cacheReadH), (point.cacheCreationInputTokens / maxTokens) * plotH);
-            const otherInputH = Math.max(0, inputH - cacheReadH - cacheWriteH);
+            const cacheWriteH = Math.min(
+              Math.max(0, inputH - cacheReadH),
+              (point.cacheCreationInputTokens / maxTokens) * plotH,
+            );
+            const directInputH = Math.max(0, inputH - cacheReadH - cacheWriteH);
             const baseY = pad.top + plotH;
             const labelEvery = Math.max(1, Math.ceil(points.length / 8));
             return (
               <g key={point.bucketStart}>
-                <rect x={x} y={baseY - otherInputH} width={barW} height={otherInputH} className="statistics-bar-input" rx="2" />
-                <rect x={x} y={baseY - otherInputH - cacheReadH} width={barW} height={cacheReadH} className="statistics-bar-hit" rx="2" />
+                <rect x={x} y={baseY - directInputH} width={barW} height={directInputH} className="statistics-bar-input" rx="2" />
+                <rect x={x} y={baseY - directInputH - cacheReadH} width={barW} height={cacheReadH} className="statistics-bar-hit" rx="2" />
                 <rect x={x} y={baseY - inputH} width={barW} height={cacheWriteH} className="statistics-bar-create" rx="2" />
-                <rect x={x + barW * 0.7} y={baseY - outputH} width={Math.max(3, barW * 0.3)} height={outputH} className="statistics-bar-output" rx="2" />
+                <rect x={x + barW * 0.72} y={baseY - outputH} width={Math.max(3, barW * 0.28)} height={outputH} className="statistics-bar-output" rx="2" />
                 <title>{`${formatTrendLabel(point.bucketStart, granularity, locale)} · ${t("logs.tokens.input")}: ${formatTokens(point.inputTokens, locale)} · ${t("logs.tokens.cacheRead")}: ${formatTokens(point.cacheReadInputTokens, locale)} · ${t("logs.tokens.cacheWrite")}: ${formatTokens(point.cacheCreationInputTokens, locale)} · ${t("logs.tokens.output")}: ${formatTokens(point.outputTokens, locale)}`}</title>
                 {index % labelEvery === 0 && (
                   <text x={x + barW / 2} y={height - 10} textAnchor="middle" className="statistics-axis-label">
@@ -240,77 +224,45 @@ function UsageTrend({
           })}
         </svg>
       )}
-    </div>
+    </section>
   );
 }
 
-function QuotaOperations({
-  rows,
-  locale,
-  t,
-  now,
-}: {
-  rows: QuotaRow[];
-  locale: string;
-  t: TFn;
-  now: number;
-}) {
-  const projected = useMemo(() => rows.map(row => ({ row, projection: projectQuota(row, now) }))
-    .sort((a, b) => {
-      const rank = { limit: 0, attention: 1, ready: 2 } as const;
-      return rank[a.projection.status] - rank[b.projection.status]
-        || b.row.usedPercent - a.row.usedPercent
-        || a.row.periodEnd - b.row.periodEnd;
-    }), [now, rows]);
-
+function QuotaTable({ rows, locale, t }: { rows: QuotaRow[]; locale: string; t: TFn }) {
   return (
     <section className="panel statistics-quota-panel">
-      <div className="statistics-panel-head">
-        <h2>{t("pws.rateLimits")}</h2>
-        {projected.some(item => item.projection.status !== "ready")
-          ? <span className="statistics-status-badge attention">{t("pws.attentionTitle")}</span>
-          : projected.length > 0
-            ? <span className="statistics-status-badge ready">{t("pws.allSystemsOk")}</span>
-            : null}
-      </div>
-      {projected.length === 0 ? <div className="statistics-empty muted">{t("pws.dashboard.noQuota")}</div> : (
+      <div className="statistics-panel-head"><h2>{t("pws.rateLimits")}</h2></div>
+      {rows.length === 0 ? <div className="statistics-empty muted">{t("pws.dashboard.noQuota")}</div> : (
         <div className="tbl-wrap statistics-table-wrap">
-          <table className="tbl statistics-table statistics-operations-table">
+          <table className="tbl statistics-table statistics-quota-table">
             <thead><tr>
               <th>{t("logs.col.provider")} / {t("auth.adminAccountLabel")}</th>
               <th>{t("pws.rateLimits")}</th>
               <th>%</th>
-              <th>{t("codexAuth.resets")}</th>
               <th>{t("usage.col.tokens")}</th>
-              <th>{t("logs.col.status")}</th>
+              <th>{t("pws.col.cost")}</th>
             </tr></thead>
-            <tbody>{projected.map(({ row, projection }) => (
-              <tr key={`${row.provider}-${row.account}-${row.quotaType}-${row.periodEnd}`} className={`statistics-quota-row ${projection.status}`}>
+            <tbody>{rows.map(row => (
+              <tr key={`${row.provider}-${row.account}-${row.quotaType}-${row.periodEnd}`}>
                 <td>
                   <strong>{formatProviderDisplayName(row.provider, t)}</strong>
                   {row.account !== "default" && <small>{row.account}</small>}
                 </td>
                 <td>
                   <span className={`statistics-quota-badge ${row.quotaType}`}>{quotaLabel(t, row)}</span>
-                  <small className="mono">{formatDateTime(row.periodStart, locale)} → {formatDateTime(row.periodEnd, locale)}</small>
+                  <small className="mono statistics-period">{formatDateTime(row.periodStart, locale)} → {formatDateTime(row.periodEnd, locale)}</small>
                 </td>
                 <td>
                   <div className="statistics-percent-cell">
                     <strong>{Math.round(row.usedPercent)}%</strong>
                     <span className="statistics-progress"><i style={{ width: `${Math.max(0, Math.min(100, row.usedPercent))}%` }} /></span>
                   </div>
-                  <small className="mono">{Math.round(projection.remainingPercent)}%</small>
                 </td>
-                <td>{quotaResetText(t, row, now, locale)}</td>
                 <td className="mono">
-                  {formatTokens(row.usedTokens, locale)}
-                  {row.estimatedTotalTokens !== null && <small>/ {formatTokens(row.estimatedTotalTokens, locale)}</small>}
+                  {formatTokens(row.usedTokens, locale)} / {row.estimatedTotalTokens === null ? "—" : formatTokens(row.estimatedTotalTokens, locale)}
                 </td>
-                <td>
-                  <span className={`statistics-status-badge ${projection.status}`}>{statusLabel(t, projection.status)}</span>
-                  {projection.status === "attention" && projection.exhaustAt !== null && projection.exhaustAt < row.periodEnd && (
-                    <small className="mono">~{formatDuration(projection.exhaustAt - now)}</small>
-                  )}
+                <td className="mono">
+                  {formatEstimatedUsdValue(row.usedCostUsd, locale)} / {row.estimatedTotalCostUsd === null ? "—" : formatEstimatedUsdValue(row.estimatedTotalCostUsd, locale)}
                 </td>
               </tr>
             ))}</tbody>
@@ -321,104 +273,62 @@ function QuotaOperations({
   );
 }
 
-function ConsumptionAttribution({
-  rows,
-  summary,
-  previous,
-  locale,
-  t,
-}: {
-  rows: ModelRow[];
-  summary: Summary;
-  previous: Summary;
-  locale: string;
-  t: TFn;
-}) {
-  const uncachedInput = Math.max(0, summary.inputTokens - summary.cacheReadInputTokens - summary.cacheCreationInputTokens);
-  const tokenDelta = delta(summary.inputTokens + summary.outputTokens, previous.inputTokens + previous.outputTokens);
-  const parts = [
-    [t("logs.tokens.input"), uncachedInput],
-    [t("logs.tokens.cacheRead"), summary.cacheReadInputTokens],
-    [t("logs.tokens.cacheWrite"), summary.cacheCreationInputTokens],
-    [t("logs.tokens.output"), summary.outputTokens],
-    [t("logs.tokens.reasoning"), summary.reasoningOutputTokens],
-  ] as const;
-
+function ModelTable({ rows, locale, t }: { rows: ModelRow[]; locale: string; t: TFn }) {
   return (
-    <section className="panel statistics-attribution-panel">
-      <div className="statistics-panel-head">
-        <h2>{t("pws.modelBreakdown")}</h2>
-        <span className={`statistics-delta${tokenDelta !== null && tokenDelta > 0 ? " up" : tokenDelta !== null && tokenDelta < 0 ? " down" : ""}`}>
-          Δ {formatDelta(tokenDelta)}
-        </span>
-      </div>
-      {rows.length === 0 ? <div className="statistics-empty compact muted">{t("pws.dashboard.noUsage")}</div> : (
-        <div className="statistics-contributors">
-          {rows.slice(0, 4).map(row => (
-            <div key={`${row.provider}-${row.account}-${row.model}`} className="statistics-contributor-row">
-              <div className="statistics-contributor-name">
-                <strong>{formatProviderDisplayName(row.provider, t)} / {modelLabel(row.model)}</strong>
-                {row.account !== "default" && <small>{row.account}</small>}
-              </div>
-              <div className="statistics-contributor-track"><i style={{ width: `${Math.max(2, row.shareRatio * 100)}%` }} /></div>
-              <div className="statistics-contributor-value mono">
-                <strong>{formatTokens(row.inputTokens + row.outputTokens, locale)}</strong>
-                <small>{pct(row.shareRatio)}</small>
-              </div>
-            </div>
-          ))}
+    <section className="panel statistics-model-panel">
+      <div className="statistics-panel-head"><h2>{t("pws.modelBreakdown")}</h2></div>
+      {rows.length === 0 ? <div className="statistics-empty muted">{t("pws.dashboard.noUsage")}</div> : (
+        <div className="tbl-wrap statistics-table-wrap">
+          <table className="tbl statistics-table statistics-model-table">
+            <thead><tr>
+              <th>#</th>
+              <th>{t("logs.col.provider")} / {t("models.contextModel")}</th>
+              <th className="num">{t("usage.col.requests")}</th>
+              <th className="num statistics-input-column">{t("logs.tokens.input")}</th>
+              <th className="num">{t("logs.tokens.output")}</th>
+              <th className="num">{t("logs.tokens.reasoning")}</th>
+              <th className="num">{t("pws.col.cost")}</th>
+            </tr></thead>
+            <tbody>{rows.map((row, index) => (
+              <tr key={`${row.provider}-${row.account}-${row.model}`}>
+                <td>{index + 1}</td>
+                <td>
+                  <strong>{formatProviderDisplayName(row.provider, t)} / {modelLabel(row.model)}</strong>
+                  {row.account !== "default" && <small>{row.account}</small>}
+                </td>
+                <td className="num">{row.requests.toLocaleString(locale)}</td>
+                <td className="num statistics-input-cell">
+                  <strong>{formatTokens(row.inputTokens, locale)}</strong>
+                  <small>
+                    <span>{t("logs.tokens.cacheRead")}: {formatTokens(row.cacheReadInputTokens, locale)}</span>
+                    <span>{t("logs.tokens.cacheWrite")}: {formatTokens(row.cacheCreationInputTokens, locale)}</span>
+                  </small>
+                </td>
+                <td className="num mono">{formatTokens(row.outputTokens, locale)}</td>
+                <td className="num mono">{formatTokens(row.reasoningOutputTokens, locale)}</td>
+                <td className="num mono">{formatEstimatedUsdValue(row.estimatedCostUsd, locale)}</td>
+              </tr>
+            ))}</tbody>
+          </table>
         </div>
       )}
-      <div className="statistics-token-strip">
-        {parts.map(([label, value]) => (
-          <div key={label}><span className="muted">{label}</span><strong className="mono">{formatTokens(value, locale)}</strong></div>
-        ))}
-      </div>
-      <div className="statistics-attribution-foot muted">
-        <span>{t("usage.col.requests")} <strong>{summary.requests.toLocaleString(locale)}</strong></span>
-        <span>{t("pws.estimatedCost")} <strong>{formatEstimatedUsdValue(summary.estimatedCostUsd, locale)}</strong></span>
-      </div>
     </section>
   );
 }
 
-function ModelTable({ rows, locale, t }: { rows: ModelRow[]; locale: string; t: TFn }) {
-  return (
-    <div className="tbl-wrap statistics-table-wrap">
-      <table className="tbl statistics-table statistics-model-table">
-        <thead><tr>
-          <th>#</th>
-          <th>{t("logs.col.provider")} / {t("models.contextModel")}</th>
-          <th className="num">{t("usage.col.requests")}</th>
-          <th className="num">{t("logs.tokens.input")}</th>
-          <th className="num">{t("logs.tokens.output")}</th>
-          <th className="num">{t("pws.col.cost")}</th>
-        </tr></thead>
-        <tbody>{rows.map((row, index) => (
-          <tr key={`${row.provider}-${row.account}-${row.model}`}>
-            <td>{index + 1}</td>
-            <td>
-              <strong>{formatProviderDisplayName(row.provider, t)} / {modelLabel(row.model)}</strong>
-              {row.account !== "default" && <small>{row.account}</small>}
-            </td>
-            <td className="num">{row.requests.toLocaleString(locale)}</td>
-            <td className="num statistics-input-cell">
-              <strong>{formatTokens(row.inputTokens, locale)}</strong>
-              <small>
-                <span>{t("logs.tokens.cacheRead")}: {formatTokens(row.cacheReadInputTokens, locale)}</span>
-                <span>{t("logs.tokens.cacheWrite")}: {formatTokens(row.cacheCreationInputTokens, locale)}</span>
-              </small>
-            </td>
-            <td className="num mono">{formatTokens(row.outputTokens, locale)}</td>
-            <td className="num mono">{formatEstimatedUsdValue(row.estimatedCostUsd, locale)}</td>
-          </tr>
-        ))}</tbody>
-      </table>
-    </div>
-  );
-}
-
-function PriceModal({ apiBase, open, onClose, t }: { apiBase: string; open: boolean; onClose: () => void; t: TFn }) {
+function PriceModal({
+  apiBase,
+  open,
+  onClose,
+  onChanged,
+  t,
+}: {
+  apiBase: string;
+  open: boolean;
+  onClose: () => void;
+  onChanged: () => void;
+  t: TFn;
+}) {
   const [rows, setRows] = useState<PriceRow[]>([]);
   const [drafts, setDrafts] = useState<Record<string, PriceDraft>>({});
   const [saving, setSaving] = useState<string | null>(null);
@@ -442,7 +352,12 @@ function PriceModal({ apiBase, open, onClose, t }: { apiBase: string; open: bool
   useEffect(() => {
     if (!open) return;
     void load().catch(() => setError(t("usage.loadError")));
-  }, [load, open, t]);
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [load, onClose, open, t]);
 
   if (!open) return null;
 
@@ -469,6 +384,7 @@ function PriceModal({ apiBase, open, onClose, t }: { apiBase: string; open: bool
       });
       if (!res.ok) throw new Error(`${res.status}`);
       await load();
+      onChanged();
     } catch {
       setError(t("usage.loadError"));
     } finally {
@@ -478,9 +394,9 @@ function PriceModal({ apiBase, open, onClose, t }: { apiBase: string; open: bool
 
   return (
     <div className="statistics-modal-backdrop" role="presentation" onMouseDown={event => { if (event.currentTarget === event.target) onClose(); }}>
-      <div className="statistics-modal panel" role="dialog" aria-modal="true" aria-label={t("pws.editSettings")}>
+      <div className="statistics-modal panel" role="dialog" aria-modal="true" aria-label={t("pws.pricing")}>
         <div className="statistics-modal-head">
-          <div><h2>{t("pws.editSettings")}</h2><p className="muted">{t("pws.costDisclaimer")}</p></div>
+          <div><h2>{t("pws.pricing")}</h2><p className="muted">{t("pws.costDisclaimer")}</p></div>
           <button type="button" className="btn" onClick={onClose}>{t("common.close")}</button>
         </div>
         {error && <div className="notice notice-err">{error}</div>}
@@ -506,11 +422,7 @@ function PriceModal({ apiBase, open, onClose, t }: { apiBase: string; open: bool
                   <input className="input statistics-price-input" type="number" min="0" step="0.01" value={draft[field]} onChange={event => change(key, field, event.target.value)} />
                 </td>
               ))}
-              <td>
-                <span className={`statistics-price-source${row.custom ? " custom" : ""}`}>
-                  {row.custom ? t("models.customBadge") : row.source === "unpriced" ? t("logs.cost.unavailable") : t("prov.default")}
-                </span>
-              </td>
+              <td><span className={`statistics-price-source${row.custom ? " custom" : ""}`}>{priceSourceLabel(t, row)}</span></td>
               <td className="statistics-price-actions">
                 <button type="button" className="btn btn-primary" disabled={saving === key} onClick={() => void persist(row)}>
                   {saving === key ? t("common.saving") : t("common.save")}
@@ -544,9 +456,9 @@ export default function Statistics({ apiBase = API_BASE_DEFAULT }: { apiBase?: s
   const [priceOpen, setPriceOpen] = useState(false);
   const sequence = useRef(0);
 
-  const load = useCallback(async (silent = false) => {
+  const load = useCallback(async () => {
     const currentSequence = ++sequence.current;
-    if (!silent) setLoading(true);
+    setLoading(data === null);
     setError(null);
     const params = new URLSearchParams({ from: String(from), to: String(to) });
     if (provider) params.set("provider", provider);
@@ -562,15 +474,9 @@ export default function Statistics({ apiBase = API_BASE_DEFAULT }: { apiBase?: s
     } finally {
       if (sequence.current === currentSequence) setLoading(false);
     }
-  }, [account, apiBase, from, model, provider, t, to]);
+  }, [account, apiBase, data, from, model, provider, t, to]);
 
-  useEffect(() => { void load(); }, [load]);
-  useEffect(() => {
-    const timer = window.setInterval(() => {
-      if (document.visibilityState === "visible") void load(true);
-    }, 60_000);
-    return () => window.clearInterval(timer);
-  }, [load]);
+  useEffect(() => { void load(); }, [from, provider, account, model, to]);
 
   const allLabel = t("logs.filter.surface.all");
   const providerOptions = useMemo(() => [
@@ -589,6 +495,9 @@ export default function Statistics({ apiBase = API_BASE_DEFAULT }: { apiBase?: s
   const visibleQuotas = useMemo(() => (data?.quotas ?? []).filter(row =>
     (!provider || row.provider === provider) && (!account || row.account === account)
   ), [account, data?.quotas, provider]);
+
+  const summary = data?.summary;
+  const previous = data?.previousSummary;
 
   return (
     <div className="statistics-page">
@@ -611,32 +520,59 @@ export default function Statistics({ apiBase = API_BASE_DEFAULT }: { apiBase?: s
             onChange={event => { const next = parseLocalInput(event.target.value); if (next !== null) setTo(next); }}
           />
           <Select value={provider} options={providerOptions} onChange={value => { setProvider(value); setAccount(""); setModel(""); }} label={t("logs.col.provider")} />
-          <Select value={account} options={accountOptions} onChange={setAccount} label={t("auth.adminAccountLabel")} />
+          <Select value={account} options={accountOptions} onChange={value => { setAccount(value); setModel(""); }} label={t("auth.adminAccountLabel")} />
           <Select value={model} options={modelOptions} onChange={setModel} label={t("models.contextModel")} />
-          <button type="button" className="btn" onClick={() => setPriceOpen(true)}>{t("pws.editSettings")}</button>
+          <button type="button" className="btn" onClick={() => setPriceOpen(true)}>{t("pws.pricing")}</button>
           <button type="button" className="btn" onClick={() => void load()}>{t("startup.refresh")}</button>
         </div>
       </div>
 
       {error && <div className="notice notice-err">{error}</div>}
-      {loading && !data ? <div className="panel statistics-loading muted">{t("common.loading")}</div> : data ? (
+      {loading && !data ? <div className="panel statistics-loading muted">{t("common.loading")}</div> : data && summary && previous ? (
         <>
-          <QuotaOperations rows={visibleQuotas} locale={locale} t={t} now={data.generatedAt} />
-          <ConsumptionAttribution rows={data.models} summary={data.summary} previous={data.previousSummary} locale={locale} t={t} />
+          <div className="statistics-metrics">
+            <MetricCard
+              label={t("usage.col.requests")}
+              value={summary.requests.toLocaleString(locale)}
+              comparison={formatDelta(delta(summary.requests, previous.requests))}
+            />
+            <MetricCard
+              label={t("logs.tokens.input")}
+              value={formatTokens(summary.inputTokens, locale)}
+              comparison={formatDelta(delta(summary.inputTokens, previous.inputTokens))}
+            >
+              <div className="statistics-input-breakdown">
+                <span><i className="statistics-swatch hit" />{t("logs.tokens.cacheRead")} <strong>{formatTokens(summary.cacheReadInputTokens, locale)}</strong></span>
+                <span><i className="statistics-swatch create" />{t("logs.tokens.cacheWrite")} <strong>{formatTokens(summary.cacheCreationInputTokens, locale)}</strong></span>
+              </div>
+            </MetricCard>
+            <MetricCard
+              label={t("logs.tokens.output")}
+              value={formatTokens(summary.outputTokens, locale)}
+              comparison={formatDelta(delta(summary.outputTokens, previous.outputTokens))}
+            />
+            <MetricCard
+              label={t("logs.tokens.reasoning")}
+              value={formatTokens(summary.reasoningOutputTokens, locale)}
+              comparison={formatDelta(delta(summary.reasoningOutputTokens, previous.reasoningOutputTokens))}
+            />
+            <MetricCard
+              label={t("usage.cost.total")}
+              value={formatEstimatedUsdValue(summary.estimatedCostUsd, locale)}
+              comparison={formatDelta(delta(summary.estimatedCostUsd, previous.estimatedCostUsd))}
+            />
+          </div>
 
-          <details className="panel statistics-details">
-            <summary>{t("usage.section.overview")}</summary>
+          <div className="statistics-main-grid">
             <UsageTrend points={data.trend} granularity={data.granularity} locale={locale} t={t} />
-          </details>
+            <QuotaTable rows={visibleQuotas} locale={locale} t={t} />
+          </div>
 
-          <details className="panel statistics-details">
-            <summary>{t("pws.modelBreakdown")}</summary>
-            <ModelTable rows={data.models} locale={locale} t={t} />
-          </details>
+          <ModelTable rows={data.models} locale={locale} t={t} />
         </>
       ) : null}
 
-      <PriceModal apiBase={apiBase} open={priceOpen} onClose={() => setPriceOpen(false)} t={t} />
+      <PriceModal apiBase={apiBase} open={priceOpen} onClose={() => setPriceOpen(false)} onChanged={() => void load()} t={t} />
     </div>
   );
 }
