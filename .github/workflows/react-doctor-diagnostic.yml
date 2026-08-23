@@ -1,0 +1,31 @@
+name: React Doctor Diagnostic
+
+on:
+  push:
+    branches: [feat/statistics-dashboard]
+
+permissions:
+  contents: read
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Print changed-file React Doctor report
+        shell: bash
+        run: |
+          set -uo pipefail
+          git diff --name-only --diff-filter=AMR origin/dev...HEAD \
+            | sed -n 's#^gui/##p' > "$RUNNER_TEMP/react-doctor-files.txt"
+          npx --yes react-doctor@0.9.11 gui \
+            --json --json-compact --scope changed \
+            --changed-files-from "$RUNNER_TEMP/react-doctor-files.txt" \
+            --blocking warning > "$RUNNER_TEMP/react-doctor-report.json"
+          status=$?
+          cat "$RUNNER_TEMP/react-doctor-report.json"
+          echo "react-doctor-exit=$status"
+          exit 0
