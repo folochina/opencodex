@@ -3,6 +3,9 @@ name: React Doctor Diagnostic
 on:
   push:
     branches: [feat/statistics-dashboard]
+  pull_request:
+    branches: [dev]
+    types: [opened, synchronize, reopened]
 
 permissions:
   contents: read
