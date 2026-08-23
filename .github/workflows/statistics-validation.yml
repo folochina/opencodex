@@ -3,6 +3,9 @@ name: Statistics Validation
 on:
   push:
     branches: ["feat/statistics-dashboard"]
+  pull_request:
+    branches: ["dev"]
+    types: [opened, synchronize, reopened]
   workflow_dispatch:
 
 permissions:
@@ -224,7 +227,7 @@ jobs:
           export E2E_ADMIN_TOKEN="$ADMIN_TOKEN"
 
           cat > .tmp/e2e/run.mjs <<'JS'
-          import { readFileSync, writeFileSync } from "node:fs";
+          import { writeFileSync } from "node:fs";
           import { chromium } from "playwright";
 
           const base = process.env.E2E_BASE_URL;
