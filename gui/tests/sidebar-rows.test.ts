@@ -27,11 +27,11 @@ test("every row maps one-to-one onto a page", () => {
   const navBlock = src.slice(src.indexOf("const NAV: NavEntry[] = ["), src.indexOf("];", src.indexOf("const NAV: NavEntry[] = [")));
   const ids = [...navBlock.matchAll(/\{ id: "([^"]+)"/g)].map(m => m[1]);
 
-  // The exact nine, in order. A count alone would pass if a row were swapped for
-  // another, and Routing folding into Models is precisely that kind of change.
+  // The exact destinations, in order. Statistics is a separate surface so Usage
+  // remains backward-compatible and no two sidebar rows point at the same page.
   expect(ids).toEqual([
     "dashboard", "codex-auth", "providers", "models", "subagents",
-    "logs", "usage", "storage", "integrations",
+    "logs", "usage", "statistics", "storage", "integrations",
   ]);
   // No two rows share a page id, which is what made the correction helper necessary.
   expect(new Set(ids).size).toBe(ids.length);

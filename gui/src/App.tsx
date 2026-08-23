@@ -6,6 +6,7 @@ import Models from "./pages/Models";
 import Subagents from "./pages/Subagents";
 import Logs from "./pages/Logs";
 import Usage from "./pages/Usage";
+import Statistics from "./pages/Statistics";
 import Storage from "./pages/Storage";
 import CodexAuth from "./pages/CodexAuth";
 import Integrations from "./pages/Integrations";
@@ -14,6 +15,7 @@ import ErrorBoundary from "./components/ErrorBoundary";
 import { SidebarGithubRow } from "./components/sidebar-github-row";
 import { IconGrid, IconServer, IconBoxes, IconBot, IconList, IconActivity, IconHardDrive, IconKey, IconMenu, IconSun, IconMoon, IconMonitor, IconGlobe, IconPower, IconX, IconRefresh} from "./icons";
 import { useI18n, useT, LOCALES, localeDisplayName, type Locale, type TKey } from "./i18n/shared";
+import { statisticsText } from "./statistics-i18n";
 import { Select } from "./ui";
 import { installApiAuthFetch } from "./api";
 import { type Page } from "./app-routing";
@@ -26,7 +28,8 @@ installApiAuthFetch();
 
 type Theme = "light" | "dark" | "system";
 
-const PAGE_TKEY: Record<Page, TKey> = {
+type ExistingPage = Exclude<Page, "statistics">;
+const PAGE_TKEY: Record<ExistingPage, TKey> = {
   dashboard: "nav.dashboard",
   startup: "nav.startup",
   providers: "nav.providers",
@@ -50,11 +53,9 @@ const THEME_KEY = "ocx-theme";
  * job was stopping the sidebar from lighting two rows and claiming the user was in two
  * places. Removing the duplicate removed all four.
  */
-type NavEntry = {
-  id: Page;
-  tkey: TKey;
-  Icon: typeof IconGrid;
-};
+type NavEntry =
+  | { id: ExistingPage; tkey: TKey; Icon: typeof IconGrid }
+  | { id: "statistics"; Icon: typeof IconGrid };
 
 const NAV: NavEntry[] = [
   { id: "dashboard", tkey: "nav.dashboard", Icon: IconGrid },
@@ -64,6 +65,7 @@ const NAV: NavEntry[] = [
   { id: "subagents", tkey: "nav.subagents", Icon: IconBot },
   { id: "logs", tkey: "nav.logs", Icon: IconList },
   { id: "usage", tkey: "nav.usage", Icon: IconActivity },
+  { id: "statistics", Icon: IconActivity },
   { id: "storage", tkey: "nav.storage", Icon: IconHardDrive },
   { id: "integrations", tkey: "nav.integrations", Icon: IconGlobe },
 ];
@@ -101,6 +103,10 @@ export default function App() {
   const [theme, setTheme] = useState<Theme>(readStoredTheme);
   const { locale, setLocale } = useI18n();
   const t = useT();
+
+  const pageLabel = (value: Page): string => value === "statistics"
+    ? statisticsText(locale, "title")
+    : t(PAGE_TKEY[value]);
 
   // Narrow screens: the sidebar becomes an off-canvas drawer behind a hamburger toggle.
   const [navOpen, setNavOpen] = useState(false);
@@ -246,8 +252,9 @@ export default function App() {
             ClaudeCode owns GET/PUT /api/claude-code now, and the row itself is gone.
           */}
           {NAV.map(entry => {
-            const { id, tkey, Icon } = entry;
+            const { id, Icon } = entry;
             const active = id === page;
+            const label = id === "statistics" ? statisticsText(locale, "title") : t(entry.tkey);
             return (
               <div key={id} className="nav-entry">
                 <button type="button" className={`nav-item${active ? " active" : ""}`}
@@ -258,7 +265,7 @@ export default function App() {
                     setNavOpen(false);
                   }}
                   aria-current={active ? "page" : undefined}>
-                  <Icon /> {t(tkey)}
+                  <Icon /> {label}
                 </button>
               </div>
             );
@@ -322,7 +329,7 @@ export default function App() {
         }`}>
           <ErrorBoundary
             key={page}
-            pageName={t(PAGE_TKEY[page])}
+            pageName={pageLabel(page)}
             title={t("errorBoundary.title")}
             message={t("errorBoundary.message")}
             detailsLabel={t("errorBoundary.details")}
@@ -335,6 +342,7 @@ export default function App() {
             {page === "subagents" && <Subagents key={API_BASE} apiBase={API_BASE} />}
             {page === "logs" && <Logs apiBase={API_BASE} />}
             {page === "usage" && <Usage apiBase={API_BASE} />}
+            {page === "statistics" && <Statistics apiBase={API_BASE} />}
             {page === "storage" && <Storage apiBase={API_BASE} />}
             {page === "codex-auth" && <CodexAuth apiBase={API_BASE} />}
             {page === "integrations" && <Integrations apiBase={API_BASE} />}

@@ -1,0 +1,360 @@
+name: Statistics Validation
+
+on:
+  push:
+    branches: ["feat/statistics-dashboard"]
+  pull_request:
+    branches: ["dev"]
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: statistics-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gates:
+    name: gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Install dependencies
+        run: |
+          bun install --frozen-lockfile
+          cd gui
+          bun install --frozen-lockfile
+          cd ../docs-site
+          bun install --frozen-lockfile
+
+      - name: Focused statistics tests
+        run: |
+          bun test --isolate tests/statistics.test.ts
+          cd gui
+          bun test --isolate tests/statistics.test.ts tests/sidebar-rows.test.ts
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Privacy scan
+        run: bun run privacy:scan
+
+      - name: GUI tests
+        run: cd gui && bun test --isolate tests
+
+      - name: GUI lint
+        run: cd gui && bun run lint
+
+      - name: GUI i18n lint
+        run: cd gui && bun run lint:i18n
+
+      - name: GUI build
+        run: cd gui && bun run build
+
+      - name: Docs build
+        run: cd docs-site && bun run build
+
+  suite:
+    name: full suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Install dependencies
+        run: |
+          bun install --frozen-lockfile
+          cd gui
+          bun install --frozen-lockfile
+
+      - name: Build GUI
+        run: cd gui && bun run build
+
+      - name: Full root test suite
+        run: bun test --isolate --timeout 60000 tests
+
+  e2e:
+    name: browser e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Install and build
+        run: |
+          bun install --frozen-lockfile
+          cd gui
+          bun install --frozen-lockfile
+          bun run build
+
+      - name: Install pinned Playwright
+        run: |
+          mkdir -p .tmp/e2e
+          cd .tmp/e2e
+          npm init -y >/dev/null
+          npm install --save-exact playwright@1.55.0
+          npx playwright install --with-deps chromium
+
+      - name: Run browser E2E
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .tmp/e2e-artifacts
+          E2E_HOME="$(mktemp -d)"
+          URL_FILE="$RUNNER_TEMP/statistics-e2e-url"
+          ADMIN_TOKEN="ocx_admin_$(printf 'A%.0s' $(seq 1 43))"
+          export OPENCODEX_HOME="$E2E_HOME"
+          export OPENCODEX_ADMIN_AUTH_TOKEN="$ADMIN_TOKEN"
+          export OCX_E2E_FAKE_KEY="validation-only"
+          export E2E_URL_FILE="$URL_FILE"
+
+          cat > .tmp/statistics-e2e-server.ts <<'TS'
+          import { mkdirSync, writeFileSync } from "node:fs";
+          import { join } from "node:path";
+          import { startServer } from "../src/server";
+
+          const home = process.env.OPENCODEX_HOME!;
+          mkdirSync(home, { recursive: true, mode: 0o700 });
+          const config = {
+            port: 0,
+            hostname: "127.0.0.1",
+            defaultProvider: "openai-apikey",
+            clientIntegrations: { codex: false, grok: false, "claude-desktop": false },
+            claudeCode: { enabled: false },
+            providers: {
+              "openai-apikey": {
+                adapter: "openai-responses",
+                baseUrl: "https://api.openai.com/v1",
+                authMode: "key",
+                apiKey: "${OCX_E2E_FAKE_KEY}",
+                liveModels: false,
+                models: ["gpt-5.4", "gpt-5.4-mini"],
+              },
+            },
+          };
+          writeFileSync(join(home, "config.json"), `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
+
+          const now = Date.now();
+          const rows = [];
+          for (let day = 0; day < 7; day += 1) {
+            for (let modelIndex = 0; modelIndex < 2; modelIndex += 1) {
+              const model = modelIndex === 0 ? "gpt-5.4" : "gpt-5.4-mini";
+              const input = 120_000 + day * 11_000 + modelIndex * 17_000;
+              const cacheRead = 70_000 + day * 5_000;
+              const cacheWrite = 12_000 + modelIndex * 3_000;
+              const output = 18_000 + day * 2_000;
+              rows.push({
+                requestId: `ocx-stat-e2e-${day}-${modelIndex}`,
+                timestamp: now - day * 86_400_000 - modelIndex * 3_600_000,
+                provider: "openai-apikey",
+                accountLogLabel: modelIndex === 0 ? "acct-a" : "acct-b",
+                model,
+                resolvedModel: model,
+                status: 200,
+                durationMs: 1500,
+                usageStatus: "reported",
+                usage: {
+                  inputTokens: input,
+                  cacheReadInputTokens: cacheRead,
+                  cacheCreationInputTokens: cacheWrite,
+                  outputTokens: output,
+                  reasoningOutputTokens: 4_000 + day * 500,
+                },
+                totalTokens: input + output,
+              });
+            }
+          }
+          writeFileSync(join(home, "usage.jsonl"), `${rows.map(row => JSON.stringify(row)).join("\n")}\n`, { mode: 0o600 });
+
+          const server = startServer(0);
+          writeFileSync(process.env.E2E_URL_FILE!, String(server.url), "utf8");
+          const shutdown = async () => {
+            await server.stop(true);
+            process.exit(0);
+          };
+          process.on("SIGTERM", () => { void shutdown(); });
+          process.on("SIGINT", () => { void shutdown(); });
+          await new Promise(() => {});
+          TS
+
+          bun .tmp/statistics-e2e-server.ts > .tmp/e2e-artifacts/server.log 2>&1 &
+          SERVER_PID=$!
+          cleanup() {
+            kill "$SERVER_PID" 2>/dev/null || true
+            wait "$SERVER_PID" 2>/dev/null || true
+            rm -rf "$E2E_HOME"
+          }
+          trap cleanup EXIT
+
+          for _ in $(seq 1 120); do
+            if [ -s "$URL_FILE" ]; then break; fi
+            if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+              cat .tmp/e2e-artifacts/server.log
+              exit 1
+            fi
+            sleep 0.25
+          done
+          test -s "$URL_FILE"
+          export E2E_BASE_URL="$(cat "$URL_FILE")"
+          export E2E_ADMIN_TOKEN="$ADMIN_TOKEN"
+
+          cat > .tmp/e2e/run.mjs <<'JS'
+          import { writeFileSync } from "node:fs";
+          import { chromium } from "playwright";
+
+          const base = process.env.E2E_BASE_URL;
+          const admin = process.env.E2E_ADMIN_TOKEN;
+          const artifacts = new URL("../e2e-artifacts/", import.meta.url);
+          const assert = (condition, message) => {
+            if (!condition) throw new Error(message);
+          };
+          const headers = { "x-opencodex-api-key": admin };
+          const from = Date.now() - 8 * 86_400_000;
+          const to = Date.now() + 60_000;
+
+          const realStats = await fetch(`${base}api/statistics?from=${from}&to=${to}`, { headers });
+          assert(realStats.status === 200, `statistics API HTTP ${realStats.status}`);
+          const realBody = await realStats.json();
+          assert(realBody.summary?.requests === 14, `expected 14 requests, got ${realBody.summary?.requests}`);
+          assert(realBody.summary?.cacheReadInputTokens > 0, "cache read aggregate missing");
+          assert(realBody.summary?.cacheCreationInputTokens > 0, "cache creation aggregate missing");
+          assert(realBody.granularity === "1d", `expected daily granularity, got ${realBody.granularity}`);
+          assert(realBody.models?.some(row => row.provider === "openai-apikey" && row.model === "gpt-5.4"), "actual provider/model row missing");
+
+          const realPrices = await fetch(`${base}api/statistics/prices`, { headers });
+          assert(realPrices.status === 200, `prices API HTTP ${realPrices.status}`);
+          const priceBody = await realPrices.json();
+          assert(Array.isArray(priceBody.prices) && priceBody.prices.length >= 2, "price rows missing");
+
+          const browser = await chromium.launch({ headless: true });
+          const context = await browser.newContext({
+            viewport: { width: 1600, height: 1000 },
+            locale: "zh-CN",
+            extraHTTPHeaders: headers,
+          });
+          const page = await context.newPage();
+          const errors = [];
+          page.on("pageerror", error => errors.push(`pageerror: ${error.message}`));
+          page.on("console", message => {
+            if (message.type() === "error") errors.push(`console: ${message.text()}`);
+          });
+
+          await page.route("**/api/statistics?**", async route => {
+            const response = await route.fetch();
+            const body = await response.json();
+            const now = Date.now();
+            body.quotas = [{
+              provider: "openai-apikey",
+              account: "acct-a",
+              quotaType: "weekly",
+              label: "Weekly",
+              periodStart: now - 4 * 86_400_000,
+              periodEnd: now + 3 * 86_400_000,
+              usedPercent: 42,
+              usedTokens: 1_850_000,
+              estimatedTotalTokens: 4_404_762,
+              usedCostUsd: 8.64,
+              estimatedTotalCostUsd: 20.57,
+            }];
+            await route.fulfill({
+              response,
+              headers: { ...response.headers(), "content-type": "application/json" },
+              body: JSON.stringify(body),
+            });
+          });
+
+          await page.goto(`${base}#statistics`, { waitUntil: "networkidle" });
+          await page.locator(".statistics-page").waitFor();
+          assert(await page.locator('[data-page="statistics"]').count() === 1, "statistics nav row missing");
+          assert(await page.locator(".statistics-metric").count() === 5, "expected five summary metrics");
+          assert(await page.locator(".statistics-quota-table tbody tr").count() === 1, "current-period quota row missing");
+          assert(await page.locator(".statistics-model-table tbody tr").count() >= 2, "provider/model rows missing");
+          const inputSurface = await page.locator(".statistics-input-breakdown").innerText();
+          assert(inputSurface.length > 0, "input cache breakdown missing");
+          const quotaText = await page.locator(".statistics-quota-panel").innerText();
+          for (const forbidden of ["预计耗尽", "下次重置", "remaining", "expected exhaust"]) {
+            assert(!quotaText.toLowerCase().includes(forbidden.toLowerCase()), `forbidden quota field rendered: ${forbidden}`);
+          }
+
+          await page.screenshot({ path: new URL("statistics.png", artifacts).pathname, fullPage: true });
+
+          const pricingButton = page.locator(".statistics-toolbar > button").first();
+          await pricingButton.click();
+          await page.locator(".statistics-modal").waitFor();
+          const firstPriceRow = page.locator(".statistics-price-table tbody tr").first();
+          assert(await firstPriceRow.locator("input").count() === 4, "Cost4 editor must have four inputs");
+          await firstPriceRow.locator("input").first().fill("9.99");
+          await firstPriceRow.locator(".btn-primary").click();
+          await page.waitForTimeout(500);
+          const customPrices = await fetch(`${base}api/statistics/prices`, { headers }).then(response => response.json());
+          assert(customPrices.prices.some(row => row.custom === true), "custom price save did not persist");
+
+          const refreshedRow = page.locator(".statistics-price-table tbody tr").first();
+          const restore = refreshedRow.locator(".statistics-price-actions .btn").nth(1);
+          if (await restore.count()) {
+            await restore.click();
+            await page.waitForTimeout(500);
+            const resetPrices = await fetch(`${base}api/statistics/prices`, { headers }).then(response => response.json());
+            assert(resetPrices.prices.some(row => row.custom === false), "official/default price restore did not persist");
+          }
+          await page.locator(".statistics-modal-head .btn").click();
+
+          await page.locator('[data-page="usage"]').click();
+          await page.waitForTimeout(300);
+          assert(await page.locator('[data-page="usage"].active').count() === 1, "existing Usage page navigation regressed");
+          await page.locator('[data-page="statistics"]').click();
+          await page.locator(".statistics-page").waitFor();
+
+          assert(errors.length === 0, `browser errors:\n${errors.join("\n")}`);
+          writeFileSync(new URL("report.json", artifacts), JSON.stringify({
+            commit: process.env.GITHUB_SHA,
+            statisticsApi: "PASS",
+            pricesApi: "PASS",
+            usageRoute: "PASS",
+            statisticsRoute: "PASS",
+            quotaCurrentPeriod: "PASS",
+            priceSaveRestore: "PASS",
+            browserErrors: errors,
+          }, null, 2));
+          await browser.close();
+          JS
+
+          cd .tmp/e2e
+          GITHUB_SHA="$GITHUB_SHA" node run.mjs
+
+      - name: Upload E2E evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: statistics-e2e-${{ github.sha }}
+          path: .tmp/e2e-artifacts
+          if-no-files-found: warn
+          retention-days: 7
