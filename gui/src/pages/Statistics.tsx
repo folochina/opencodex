@@ -352,7 +352,7 @@ function PriceModal({
 
   useEffect(() => {
     if (!open) return;
-    void load().catch(() => setError(t("usage.loadError")));
+    queueMicrotask(() => { void load().catch(() => setError(t("usage.loadError"))); });
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") onClose();
     };
@@ -477,7 +477,7 @@ export default function Statistics({ apiBase = API_BASE_DEFAULT }: { apiBase?: s
     }
   }, [account, apiBase, from, model, provider, t, to]);
 
-  useEffect(() => { void load(); }, [load]);
+  useEffect(() => { queueMicrotask(() => { void load(); }); }, [load]);
 
   const closePrice = useCallback(() => setPriceOpen(false), []);
   const pricesChanged = useCallback(() => { void load(); }, [load]);
