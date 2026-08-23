@@ -77,6 +77,7 @@ type PriceDraft = {
 
 const API_BASE_DEFAULT = import.meta.env.VITE_API_BASE || "";
 const DAY_MS = 24 * 60 * 60_000;
+const DEFAULT_RANGE_END = Date.now();
 
 function dateTimeLocal(ms: number): string {
   const d = new Date(ms);
@@ -87,10 +88,6 @@ function dateTimeLocal(ms: number): string {
 function parseLocalInput(value: string): number | null {
   const parsed = new Date(value).getTime();
   return Number.isFinite(parsed) ? parsed : null;
-}
-
-function pct(value: number): string {
-  return `${Math.round(value * 1000) / 10}%`;
 }
 
 function delta(current: number, previous: number): number | null {
@@ -134,6 +131,10 @@ function priceSourceLabel(t: TFn, row: PriceRow): string {
   if (row.source === "jawcode") return t("logs.detail.source.jawcode");
   if (row.source === "expected") return t("logs.detail.source.expected");
   return t("logs.cost.unavailable");
+}
+
+function priceRowKey(provider: string, model: string): string {
+  return JSON.stringify([provider, model]);
 }
 
 function MetricCard({
@@ -335,18 +336,18 @@ function PriceModal({
   const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
-    setError(null);
     const res = await fetch(`${apiBase}/api/statistics/prices`);
     if (!res.ok) throw new Error(`${res.status}`);
     const data = await res.json() as { prices?: PriceRow[] };
     const prices = data.prices ?? [];
     setRows(prices);
-    setDrafts(Object.fromEntries(prices.map(row => [`${row.provider}\u0000${row.model}`, {
+    setDrafts(Object.fromEntries(prices.map(row => [priceRowKey(row.provider, row.model), {
       input: row.input ?? 0,
       output: row.output ?? 0,
       cacheRead: row.cacheRead ?? 0,
       cacheWrite: row.cacheWrite ?? 0,
     }])));
+    setError(null);
   }, [apiBase]);
 
   useEffect(() => {
@@ -373,7 +374,7 @@ function PriceModal({
   };
 
   const persist = async (row: PriceRow, reset = false) => {
-    const key = `${row.provider}\u0000${row.model}`;
+    const key = priceRowKey(row.provider, row.model);
     setSaving(key);
     setError(null);
     try {
@@ -412,7 +413,7 @@ function PriceModal({
             <th>{t("pws.stats.source")}</th>
             <th />
           </tr></thead><tbody>{rows.map(row => {
-            const key = `${row.provider}\u0000${row.model}`;
+            const key = priceRowKey(row.provider, row.model);
             const draft = drafts[key] ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
             return <tr key={key}>
               <td>{formatProviderDisplayName(row.provider, t)}</td>
@@ -444,9 +445,8 @@ function PriceModal({
 export default function Statistics({ apiBase = API_BASE_DEFAULT }: { apiBase?: string }) {
   const { locale } = useI18n();
   const t = useT();
-  const initialNow = useMemo(() => Date.now(), []);
-  const [from, setFrom] = useState(() => initialNow - 7 * DAY_MS);
-  const [to, setTo] = useState(initialNow);
+  const [from, setFrom] = useState(DEFAULT_RANGE_END - 7 * DAY_MS);
+  const [to, setTo] = useState(DEFAULT_RANGE_END);
   const [provider, setProvider] = useState("");
   const [account, setAccount] = useState("");
   const [model, setModel] = useState("");
@@ -458,8 +458,6 @@ export default function Statistics({ apiBase = API_BASE_DEFAULT }: { apiBase?: s
 
   const load = useCallback(async () => {
     const currentSequence = ++sequence.current;
-    setLoading(true);
-    setError(null);
     const params = new URLSearchParams({ from: String(from), to: String(to) });
     if (provider) params.set("provider", provider);
     if (account) params.set("account", account);
@@ -468,7 +466,10 @@ export default function Statistics({ apiBase = API_BASE_DEFAULT }: { apiBase?: s
       const res = await fetch(`${apiBase}/api/statistics?${params}`);
       if (!res.ok) throw new Error(`${res.status}`);
       const next = await res.json() as StatisticsResponse;
-      if (sequence.current === currentSequence) setData(next);
+      if (sequence.current === currentSequence) {
+        setData(next);
+        setError(null);
+      }
     } catch {
       if (sequence.current === currentSequence) setError(t("usage.loadError"));
     } finally {
@@ -478,6 +479,8 @@ export default function Statistics({ apiBase = API_BASE_DEFAULT }: { apiBase?: s
 
   useEffect(() => { void load(); }, [load]);
 
+  const closePrice = useCallback(() => setPriceOpen(false), []);
+  const pricesChanged = useCallback(() => { void load(); }, [load]);
   const allLabel = t("logs.filter.surface.all");
   const providerOptions = useMemo(() => [
     { value: "", label: allLabel },
@@ -572,7 +575,7 @@ export default function Statistics({ apiBase = API_BASE_DEFAULT }: { apiBase?: s
         </>
       ) : null}
 
-      <PriceModal apiBase={apiBase} open={priceOpen} onClose={() => setPriceOpen(false)} onChanged={() => void load()} t={t} />
+      <PriceModal apiBase={apiBase} open={priceOpen} onClose={closePrice} onChanged={pricesChanged} t={t} />
     </div>
   );
 }
